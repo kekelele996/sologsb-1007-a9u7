@@ -13,8 +13,29 @@ import {
   untrack,
 } from "solid-js";
 import { createSeedProject, uid } from "../data";
+import {
+  createLedgerFromProject,
+  deliveryStats,
+  findSegment,
+  loadLedger,
+  loadOutbox,
+  reconcileLedger,
+  saveLedger,
+  snapshotOf,
+  writeOutbox,
+} from "../delivery";
 import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
-import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
+import type {
+  Confidence,
+  DeliveryEntry,
+  DeliveryLedger,
+  DeliveryStatus,
+  PersistedEnvelope,
+  ProjectData,
+  SaveOutbox,
+  Segment,
+  TranscriptTrack,
+} from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
 const TAB_ID = uid("tab");
@@ -102,6 +123,7 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
 
 export default function OralHistoryEditor() {
   const loaded = loadProject();
+  const loadedLedger = loadLedger(loaded.project.id);
   const [project, setProject] = createSignal<ProjectData>(loaded.project);
   const [revision, setRevision] = createSignal(loaded.revision);
   const [past, setPast] = createSignal<ProjectData[]>([]);
@@ -114,7 +136,11 @@ export default function OralHistoryEditor() {
   const [helpOpen, setHelpOpen] = createSignal(false);
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
-  const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
+  const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low" | "undelivered">("all");
+  const [ledger, setLedger] = createSignal<DeliveryLedger>(
+    loadedLedger ?? createLedgerFromProject(loaded.project, { skipReviewed: true }),
+  );
+  const [outbox, setOutbox] = createSignal<SaveOutbox>(loadOutbox());
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
@@ -127,10 +153,17 @@ export default function OralHistoryEditor() {
     return data.tracks.find((track) => track.id === data.activeTrackId) ?? data.tracks[0];
   });
   const activeSegment = createMemo(() => activeTrack()?.segments.find((item) => item.id === selectedId()) ?? null);
+  const activeDeliveryEntry = createMemo<DeliveryEntry | null>(() => {
+    const segment = activeSegment();
+    return segment ? ledger().entries[segment.id] ?? null : null;
+  });
   const visibleSegments = createMemo(() => {
     const segments = activeTrack()?.segments ?? [];
     if (trackFilter() === "unreviewed") return segments.filter((segment) => !segment.reviewed);
     if (trackFilter() === "low") return segments.filter((segment) => segment.confidence <= 2 || segment.flags.lowConfidence);
+    if (trackFilter() === "undelivered") {
+      return segments.filter((segment) => ledger().entries[segment.id]?.status !== "delivered");
+    }
     return segments;
   });
   const completedPercent = createMemo(() => {
@@ -138,9 +171,13 @@ export default function OralHistoryEditor() {
     if (!segments.length) return 0;
     return Math.round((segments.filter((segment) => segment.reviewed).length / segments.length) * 100);
   });
+  const ledgerStats = createMemo(() => deliveryStats(ledger()));
   const speakerById = (speakerId: string) =>
     project().speakers.find((speaker) => speaker.id === speakerId) ?? project().speakers[0];
   const tagById = (tagId: string) => project().tags.find((tag) => tag.id === tagId);
+
+  const deliveryStatusLabel = (status: DeliveryStatus) =>
+    status === "delivered" ? "已交付" : status === "returned" ? "已退回待交" : "待交付";
 
   const commit = (label: string, mutate: (draft: ProjectData) => void) => {
     const current = structuredClone(project());
@@ -361,8 +398,158 @@ export default function OralHistoryEditor() {
     setConflict(null);
   };
 
+  /** 单独保存台账；失败则在待重试标记里记一笔，下次打开再重试。 */
+  const persistLedger = (next: DeliveryLedger) => {
+    const ok = saveLedger(next);
+    const pending = loadOutbox();
+    let outboxChanged = false;
+    if (ok) {
+      if (pending.pendingLedger) { pending.pendingLedger = false; outboxChanged = true; }
+    } else {
+      pending.pendingLedger = true;
+      pending.lastFailedAt = new Date().toISOString();
+      pending.lastFailedCopy = "ledger";
+      outboxChanged = true;
+    }
+    if (outboxChanged) {
+      writeOutbox(pending);
+      setOutbox({ ...pending });
+    }
+    setLedger(next);
+  };
+
+  /** 稿库与台账各自独立落盘；任一边失败都先记标记，不连累另一边。 */
+  const persistAll = () => {
+    const current = project();
+    const currentRevision = revision();
+    const { ledger: nextLedger, changed, invalidated } = reconcileLedger(ledger(), current);
+
+    let manuscriptOk = false;
+    let ledgerOk = false;
+    let envelope: PersistedEnvelope | null = null;
+    try {
+      envelope = saveProject(current, currentRevision, TAB_ID);
+      manuscriptOk = true;
+    } catch {
+      // 稿库落盘失败，保留待重试标记。
+    }
+    ledgerOk = saveLedger(nextLedger);
+
+    const pending = loadOutbox();
+    let outboxChanged = false;
+    if (manuscriptOk) {
+      if (pending.pendingManuscript) { pending.pendingManuscript = false; outboxChanged = true; }
+    } else {
+      pending.pendingManuscript = true;
+      pending.lastFailedAt = new Date().toISOString();
+      pending.lastFailedCopy = "manuscript";
+      outboxChanged = true;
+    }
+    if (ledgerOk) {
+      if (pending.pendingLedger) { pending.pendingLedger = false; outboxChanged = true; }
+    } else {
+      pending.pendingLedger = true;
+      pending.lastFailedAt = new Date().toISOString();
+      pending.lastFailedCopy = "ledger";
+      outboxChanged = true;
+    }
+    if (outboxChanged) {
+      writeOutbox(pending);
+      setOutbox({ ...pending });
+    }
+
+    if (changed) setLedger(nextLedger);
+    if (dirty && manuscriptOk && envelope) {
+      channel?.postMessage(envelope);
+      dirty = false;
+    }
+    if (invalidated.length) {
+      setLastAction(`交付台账：${invalidated.length} 条已作废并退回待交`);
+    }
+    return { manuscriptOk, ledgerOk, envelope };
+  };
+
+  const markDelivered = (segmentId: string) => {
+    const found = findSegment(project(), segmentId);
+    const now = new Date().toISOString();
+    const next: DeliveryLedger = structuredClone(ledger());
+    const target = next.entries[segmentId];
+    if (!target) return;
+    target.status = "delivered";
+    target.deliveredSnapshot = found ? snapshotOf(found.segment) : target.deliveredSnapshot;
+    target.deliveredAt = now;
+    target.returnedAt = null;
+    target.updatedAt = now;
+    next.updatedAt = now;
+    persistLedger(next);
+    setLastAction("已标记为交付");
+  };
+
+  const returnToPending = (segmentId: string) => {
+    const now = new Date().toISOString();
+    const next: DeliveryLedger = structuredClone(ledger());
+    const target = next.entries[segmentId];
+    if (!target) return;
+    target.status = "returned";
+    target.returnedAt = now;
+    target.updatedAt = now;
+    next.updatedAt = now;
+    persistLedger(next);
+    setLastAction("已退回待交");
+  };
+
+  /** 被打回后，对照交付时快照与稿库当前内容，列出改动项。 */
+  const snapshotChanges = (entry: DeliveryEntry, segment: Segment) => {
+    const snap = entry.deliveredSnapshot;
+    if (!snap) return [];
+    const changes: { label: string; from: string; to: string }[] = [];
+    if (snap.text !== segment.text) {
+      changes.push({ label: "正文", from: snap.text, to: segment.text });
+    }
+    const oldTime = `${formatTime(snap.start, false)} → ${formatTime(snap.end, false)}`;
+    const newTime = `${formatTime(segment.start, false)} → ${formatTime(segment.end, false)}`;
+    if (snap.start !== segment.start || snap.end !== segment.end) {
+      changes.push({ label: "时间码", from: oldTime, to: newTime });
+    }
+    if (snap.speakerId !== segment.speakerId) {
+      changes.push({
+        label: "发言人",
+        from: speakerById(snap.speakerId)?.name ?? "未知",
+        to: speakerById(segment.speakerId)?.name ?? "未知",
+      });
+    }
+    return changes;
+  };
+
   onMount(() => {
     hydrated = true;
+
+    // 旧稿升级：台账尚不存在时，按现有片段补出条目（已校对的先不放进去）。
+    if (!loadedLedger) saveLedger(ledger());
+
+    // 对齐稿库后，重试上一次打开时落盘失败的那一份（稿库 / 台账各自独立）。
+    const pending = loadOutbox();
+    let retried = false;
+    const { ledger: reconciled, changed } = reconcileLedger(ledger(), project());
+    if (changed) setLedger(reconciled);
+    if (pending.pendingManuscript) {
+      let ok = false;
+      try {
+        saveProject(project(), revision(), TAB_ID);
+        ok = true;
+      } catch {
+        // 本次重试仍失败，保留标记等下次打开。
+      }
+      if (ok) { pending.pendingManuscript = false; retried = true; }
+    }
+    if (pending.pendingLedger) {
+      if (saveLedger(reconciled)) { pending.pendingLedger = false; retried = true; }
+    }
+    if (retried) {
+      writeOutbox(pending);
+      setOutbox({ ...pending });
+    }
+
     const handleOnline = () => setOnline(true);
     const handleOffline = () => setOnline(false);
     const handleStorage = (event: StorageEvent) => {
@@ -385,10 +572,10 @@ export default function OralHistoryEditor() {
       }
       if (command && event.key.toLowerCase() === "s") {
         event.preventDefault();
-        const envelope = saveProject(project(), revision(), TAB_ID);
-        setSaveStatus("saved");
-        setLastAction("已保存本地草稿");
-        channel?.postMessage(envelope);
+        const { manuscriptOk, envelope } = persistAll();
+        setSaveStatus(manuscriptOk ? "saved" : "offline");
+        setLastAction(manuscriptOk ? "已保存本地草稿与交付台账" : "保存失败，已记标记，下次打开重试");
+        if (envelope) channel?.postMessage(envelope);
         return;
       }
       if (editing) return;
@@ -427,18 +614,14 @@ export default function OralHistoryEditor() {
   });
 
   createEffect(() => {
-    const current = project();
-    const currentRevision = revision();
+    project();
+    revision();
     if (!hydrated) return;
     setSaveStatus(online() ? "saving" : "offline");
     window.clearTimeout(saveTimer);
     saveTimer = window.setTimeout(() => {
-      const envelope = saveProject(current, currentRevision, TAB_ID);
-      setSaveStatus(online() ? "saved" : "offline");
-      if (dirty) {
-        channel?.postMessage(envelope);
-        dirty = false;
-      }
+      const { manuscriptOk } = persistAll();
+      setSaveStatus(manuscriptOk ? (online() ? "saved" : "offline") : "offline");
     }, 420);
   });
 
@@ -486,6 +669,9 @@ export default function OralHistoryEditor() {
           </div>
         </div>
         <div class="top-actions">
+          <Show when={outbox().pendingManuscript || outbox().pendingLedger}>
+            <span class="outbox-chip" title="上一次打开时有稿子没落盘，已记标记，本次打开会自动重试那一份">待重试保存</span>
+          </Show>
           <span class={`network-chip ${online() ? "online" : "offline"}`}>{online() ? "在线" : "离线可编辑"}</span>
           <button class="icon-btn" title="撤销 Ctrl/Cmd+Z" disabled={!past().length} onClick={undo}>↶</button>
           <button class="icon-btn" title="重做 Ctrl/Cmd+Shift+Z" disabled={!future().length} onClick={redo}>↷</button>
@@ -503,7 +689,12 @@ export default function OralHistoryEditor() {
               <span>{project().tracks.flatMap((track) => track.segments).filter((segment) => segment.reviewed).length} / {project().tracks.flatMap((track) => track.segments).length} 片段</span>
             </div>
             <div class="progress-track"><i style={{ width: `${completedPercent()}%` }} /></div>
-            <p>修改会自动保存在本机；断网后仍可继续校对。</p>
+            <div class="delivery-summary">
+              <span><i class="dot pending" />待交 {ledgerStats().pending}</span>
+              <span><i class="dot delivered" />已交付 {ledgerStats().delivered}</span>
+              <span><i class="dot returned" />已退回 {ledgerStats().returned}</span>
+            </div>
+            <p>稿库与交付台账各持一份：正文、时间码或发言人一改，已交付条目即作废退回待交。</p>
           </section>
 
           <section class="panel-section">
@@ -553,6 +744,7 @@ export default function OralHistoryEditor() {
             </div>
             <div class="filters" role="group" aria-label="片段筛选">
               <button class={trackFilter() === "all" ? "active" : ""} onClick={() => setTrackFilter("all")}>全部</button>
+              <button class={trackFilter() === "undelivered" ? "active" : ""} onClick={() => setTrackFilter("undelivered")}>待交付 {ledgerStats().pending + ledgerStats().returned}</button>
               <button class={trackFilter() === "unreviewed" ? "active" : ""} onClick={() => setTrackFilter("unreviewed")}>未校对</button>
               <button class={trackFilter() === "low" ? "active" : ""} onClick={() => setTrackFilter("low")}>低置信</button>
             </div>
@@ -581,6 +773,12 @@ export default function OralHistoryEditor() {
                       <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
                       <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
                       <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
+                      <Show when={ledger().entries[segment.id]}>
+                        {(entry) => {
+                          const delivery = entry();
+                          return <span class={`pill delivery ${delivery.status}`}>{deliveryStatusLabel(delivery.status)}</span>;
+                        }}
+                      </Show>
                     </div>
                     <p>{segment.text}</p>
                     <div class="segment-tags">
@@ -607,6 +805,7 @@ export default function OralHistoryEditor() {
                   <Tabs.Trigger value="correct">校对</Tabs.Trigger>
                   <Tabs.Trigger value="annotate">标注</Tabs.Trigger>
                   <Tabs.Trigger value="comments">批注 <span>{segment().comments.length}</span></Tabs.Trigger>
+                  <Tabs.Trigger value="delivery">交付</Tabs.Trigger>
                 </Tabs.List>
 
                 <Tabs.Content value="correct" class="tab-content">
@@ -713,6 +912,58 @@ export default function OralHistoryEditor() {
                       </article>
                     )}
                   </For>
+                </Tabs.Content>
+
+                <Tabs.Content value="delivery" class="tab-content">
+                  <Show when={activeDeliveryEntry()} fallback={<div class="mini-empty">该片段暂无交付台账条目。</div>}>
+                    {(entry) => {
+                      const current = entry();
+                      const seg = segment();
+                      const isDelivered = current.status === "delivered";
+                      const isReturned = current.status === "returned";
+                      const changes = isReturned ? snapshotChanges(current, seg) : [];
+                      return (
+                        <div class="delivery-panel">
+                          <div class="delivery-status-row">
+                            <span class={`delivery-badge ${current.status}`}>{deliveryStatusLabel(current.status)}</span>
+                            <span class="delivery-track">交付台账 · {activeTrack().name}</span>
+                          </div>
+
+                          <Show when={isReturned}>
+                            <div class="delivery-diff" role="alert">
+                              <strong>交付后稿库已改动，已作废并退回待交：</strong>
+                              <ul>
+                                <For each={changes}>{(change) => <li><b>{change.label}</b>：{change.from} <em>→</em> {change.to}</li>}</For>
+                              </ul>
+                              <p>校对员未保存的原句仍原样保留在稿库中，不会被台账覆盖；改定后请重新标记交付。</p>
+                            </div>
+                          </Show>
+
+                          <Show when={isDelivered && current.deliveredSnapshot}>
+                            <div class="delivery-snapshot">
+                              <span>交付时内容快照</span>
+                              <p>{current.deliveredSnapshot!.text}</p>
+                            </div>
+                          </Show>
+
+                          <Show when={current.deliveredAt}>
+                            <p class="delivery-meta">交付于 {new Date(current.deliveredAt!).toLocaleString()}</p>
+                          </Show>
+                          <Show when={isReturned && current.returnedAt}>
+                            <p class="delivery-meta">退回于 {new Date(current.returnedAt!).toLocaleString()}</p>
+                          </Show>
+
+                          <div class="delivery-actions">
+                            <button class="btn btn-primary" onClick={() => markDelivered(seg.id)}>标记已交付</button>
+                            <Show when={isDelivered}>
+                              <button class="btn btn-quiet" onClick={() => returnToPending(seg.id)}>退回待交</button>
+                            </Show>
+                          </div>
+                          <p class="delivery-note">片段正文、时间码或发言人一经改动，已交付条目即作废退回；待交与已退回的片段可在上方“待交付”筛选中查看。</p>
+                        </div>
+                      );
+                    }}
+                  </Show>
                 </Tabs.Content>
               </Tabs>
             )}

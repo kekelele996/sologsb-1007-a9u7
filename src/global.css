@@ -115,6 +115,9 @@ kbd { padding: 2px 5px; border: 1px solid rgba(0,0,0,.15); border-bottom-width: 
 .pill.dialect { background: #eee9ff; color: #5d40ad; }
 .pill.proper { background: #e6f4f2; color: #17706a; }
 .pill.done { background: #e6f5eb; color: #147044; }
+.pill.delivery { background: #eef0f2; color: #5e6870; }
+.pill.delivery.delivered { background: #e6f5eb; color: #147044; }
+.pill.delivery.returned { background: #fee8e5; color: #9f1e16; }
 .segment-body > p { margin: 0; line-height: 1.72; color: #2b343b; font-size: 13px; }
 .segment-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
 .segment-tags span { font-size: 10px; color: var(--tag-color); border: 1px solid color-mix(in srgb, var(--tag-color) 32%, white); background: color-mix(in srgb, var(--tag-color) 7%, white); border-radius: 5px; padding: 2px 5px; }
@@ -179,6 +182,35 @@ kbd { padding: 2px 5px; border: 1px solid rgba(0,0,0,.15); border-bottom-width: 
 .empty-inspector { padding: 70px 30px; text-align: center; color: #798188; }
 .empty-inspector b { color: #33414b; }
 .empty-inspector p { font-size: 12px; line-height: 1.6; }
+
+/* 交付台账 */
+.outbox-chip { font-size: 11px; padding: 5px 10px; border-radius: 999px; background: rgba(242,184,75,.18); color: #f2b84b; border: 1px solid rgba(242,184,75,.4); }
+.delivery-summary { display: flex; gap: 12px; margin-top: 10px; font-size: 11px; color: var(--muted); }
+.delivery-summary span { display: inline-flex; align-items: center; gap: 5px; }
+.delivery-summary .dot { width: 8px; height: 8px; border-radius: 50%; }
+.delivery-summary .dot.pending { background: #9aa4ad; }
+.delivery-summary .dot.delivered { background: #18764d; }
+.delivery-summary .dot.returned { background: #b42318; }
+
+.delivery-panel { display: flex; flex-direction: column; gap: 12px; }
+.delivery-status-row { display: flex; align-items: center; gap: 10px; }
+.delivery-badge { font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 999px; background: #eef0f2; color: #5e6870; }
+.delivery-badge.delivered { background: #e6f5eb; color: #147044; }
+.delivery-badge.returned { background: #fee8e5; color: #9f1e16; }
+.delivery-track { font-size: 11px; color: #8a9298; }
+.delivery-diff { border: 1px solid #f0c4bd; background: #fdf1ef; border-radius: 9px; padding: 11px 12px; font-size: 12px; color: #7a241b; }
+.delivery-diff strong { display: block; margin-bottom: 6px; }
+.delivery-diff ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
+.delivery-diff li b { margin-right: 4px; }
+.delivery-diff em { font-style: normal; color: #b42318; }
+.delivery-diff p { margin: 8px 0 0; font-size: 11px; color: #9a5a52; line-height: 1.5; }
+.delivery-snapshot { border: 1px solid var(--line); background: #f7f6f1; border-radius: 9px; padding: 10px 12px; }
+.delivery-snapshot span { font-size: 10px; color: #8a9298; }
+.delivery-snapshot p { margin: 5px 0 0; font-size: 12px; line-height: 1.6; color: #3a444b; }
+.delivery-meta { margin: 0; font-size: 10px; color: #9aa2a8; }
+.delivery-actions { display: flex; gap: 8px; }
+.delivery-actions .btn { flex: 1; }
+.delivery-note { margin: 0; font-size: 10px; line-height: 1.6; color: #8a9298; }
 
 .statusbar { min-height: 30px; padding: 6px 15px; display: flex; justify-content: space-between; align-items: center; background: #1d2831; color: #8fa1ae; font-size: 10px; }
 .status-shortcuts { color: #c0cbd2; letter-spacing: .04em; }

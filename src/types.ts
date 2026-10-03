@@ -74,3 +74,43 @@ export interface PersistedEnvelope {
   savedAt: number;
   project: ProjectData;
 }
+
+// --- 交付台账 ---
+
+export type DeliveryStatus = "pending" | "delivered" | "returned";
+
+/** 可交付内容的指纹：正文、时间码、发言人。 */
+export interface DeliverySnapshot {
+  text: string;
+  start: number;
+  end: number;
+  speakerId: string;
+}
+
+export interface DeliveryEntry {
+  segmentId: string;
+  trackId: string;
+  status: DeliveryStatus;
+  /** 最近一次标记交付时的内容快照；作废后保留以便对照。 */
+  deliveredSnapshot: DeliverySnapshot | null;
+  deliveredAt: string | null;
+  returnedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DeliveryLedger {
+  schema: 1;
+  projectId: string;
+  entries: Record<string, DeliveryEntry>;
+  updatedAt: string;
+}
+
+/** 保存失败后的待重试标记：稿库与台账各自独立。 */
+export interface SaveOutbox {
+  schema: 1;
+  pendingManuscript: boolean;
+  pendingLedger: boolean;
+  lastFailedAt: string | null;
+  lastFailedCopy: "manuscript" | "ledger" | null;
+}

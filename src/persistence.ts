@@ -1,8 +1,38 @@
 import { createSeedProject } from "./data";
-import type { PersistedEnvelope, ProjectData } from "./types";
+import type { DeliveryLedger, LedgerEnvelope, PersistedEnvelope, ProjectData } from "./types";
 
 export const STORAGE_KEY = "sologsb-1007-project-v1";
+export const LEDGER_KEY = "sologsb-1007-ledger-v1";
 export const SESSION_KEY = "sologsb-1007-session";
+const RETRY_KEY = "sologsb-1007-retry-v1";
+
+type SaveSide = "project" | "ledger";
+
+const readRetryFlags = (): Record<SaveSide, boolean> => {
+  if (typeof localStorage === "undefined") return { project: false, ledger: false };
+  try {
+    const parsed = JSON.parse(localStorage.getItem(RETRY_KEY) ?? "{}");
+    return { project: !!parsed?.project, ledger: !!parsed?.ledger };
+  } catch {
+    return { project: false, ledger: false };
+  }
+};
+
+const writeRetryFlags = (flags: Record<SaveSide, boolean>) => {
+  try {
+    localStorage.setItem(RETRY_KEY, JSON.stringify(flags));
+  } catch {
+    // 连标记都写不下时，本轮内存里的保存状态仍会提示失败。
+  }
+};
+
+/** 上次哪一边保存失败留下的标记；下次打开只重试那一份，核过的不再重来。 */
+export function pendingSaveRetry(side: SaveSide): boolean {
+  return readRetryFlags()[side];
+}
+
+const markSaveFailed = (side: SaveSide) => writeRetryFlags({ ...readRetryFlags(), [side]: true });
+const clearSaveFailed = (side: SaveSide) => writeRetryFlags({ ...readRetryFlags(), [side]: false });
 
 export function loadProject(): { project: ProjectData; revision: number } {
   if (typeof localStorage === "undefined") {
@@ -19,7 +49,7 @@ export function loadProject(): { project: ProjectData; revision: number } {
   return { project: createSeedProject(), revision: 0 };
 }
 
-export function saveProject(project: ProjectData, revision: number, tabId: string) {
+export function saveProject(project: ProjectData, revision: number, tabId: string): PersistedEnvelope | null {
   const envelope: PersistedEnvelope = {
     schema: 1,
     revision,
@@ -27,8 +57,45 @@ export function saveProject(project: ProjectData, revision: number, tabId: strin
     savedAt: Date.now(),
     project,
   };
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(envelope));
-  return envelope;
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(envelope));
+    clearSaveFailed("project");
+    return envelope;
+  } catch {
+    markSaveFailed("project");
+    return null;
+  }
+}
+
+export function loadLedger(): { ledger: DeliveryLedger; revision: number } | null {
+  if (typeof localStorage === "undefined") return null;
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LEDGER_KEY) ?? "") as LedgerEnvelope;
+    if (parsed?.schema === 1 && Array.isArray(parsed.ledger?.entries)) {
+      return { ledger: parsed.ledger, revision: parsed.revision ?? 0 };
+    }
+  } catch {
+    // 台账损坏时按没有台账处理，由调用方按现有片段补建。
+  }
+  return null;
+}
+
+export function saveLedger(ledger: DeliveryLedger, revision: number, tabId: string): LedgerEnvelope | null {
+  const envelope: LedgerEnvelope = {
+    schema: 1,
+    revision,
+    tabId,
+    savedAt: Date.now(),
+    ledger,
+  };
+  try {
+    localStorage.setItem(LEDGER_KEY, JSON.stringify(envelope));
+    clearSaveFailed("ledger");
+    return envelope;
+  } catch {
+    markSaveFailed("ledger");
+    return null;
+  }
 }
 
 export function readEnvelope(): PersistedEnvelope | null {

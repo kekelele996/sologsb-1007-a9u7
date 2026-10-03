@@ -74,3 +74,35 @@ export interface PersistedEnvelope {
   savedAt: number;
   project: ProjectData;
 }
+
+export type DeliveryStatus = "待交" | "已交付";
+
+export interface DeliveryEntry {
+  id: string;
+  trackId: string;
+  segmentId: string;
+  /** 台账自己持有的一份内容快照，与稿库互不为对方覆写。 */
+  speakerId: string;
+  start: number;
+  end: number;
+  text: string;
+  status: DeliveryStatus;
+  /** 已交付后因正文/时间码/发言人改动被打回退回待交的条目。 */
+  returned: boolean;
+  updatedAt: string;
+  deliveredAt: string | null;
+}
+
+export interface DeliveryLedger {
+  id: string;
+  entries: DeliveryEntry[];
+  updatedAt: string;
+}
+
+export interface LedgerEnvelope {
+  schema: 1;
+  revision: number;
+  tabId: string;
+  savedAt: number;
+  ledger: DeliveryLedger;
+}

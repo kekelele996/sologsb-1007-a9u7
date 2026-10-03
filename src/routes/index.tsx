@@ -13,15 +13,40 @@ import {
   untrack,
 } from "solid-js";
 import { createSeedProject, uid } from "../data";
-import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
-import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
+import { emptyLedger, syncLedgerWithProject } from "../ledger";
+import {
+  LEDGER_KEY,
+  STORAGE_KEY,
+  downloadText,
+  formatTime,
+  loadLedger,
+  loadProject,
+  parseTime,
+  pendingSaveRetry,
+  saveLedger,
+  saveProject,
+} from "../persistence";
+import type {
+  Confidence,
+  DeliveryEntry,
+  DeliveryLedger,
+  DeliveryStatus,
+  LedgerEnvelope,
+  PersistedEnvelope,
+  ProjectData,
+  Segment,
+  TranscriptTrack,
+} from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
 const TAB_ID = uid("tab");
 
-function statusText(status: "saved" | "saving" | "offline") {
+type SaveStatus = "saved" | "saving" | "offline" | "error";
+
+function statusText(status: SaveStatus) {
   if (status === "saving") return "正在保存";
   if (status === "offline") return "离线草稿";
+  if (status === "error") return "保存失败 · 待重试";
   return "已自动保存";
 }
 
@@ -102,22 +127,33 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
 
 export default function OralHistoryEditor() {
   const loaded = loadProject();
+  const storedLedger = loadLedger();
+  // 旧稿里还没有交付台账：按现有片段补出条目（已校对的片段 sync 不会放进去）；
+  // 已有台账则把稿库最新内容核对一遍，作废被动过的条目。
+  const initialSync = syncLedgerWithProject(loaded.project, storedLedger?.ledger ?? emptyLedger());
+  const ledgerChangedOnLoad = !storedLedger || initialSync.changed;
+
   const [project, setProject] = createSignal<ProjectData>(loaded.project);
   const [revision, setRevision] = createSignal(loaded.revision);
+  const [ledger, setLedger] = createSignal<DeliveryLedger>(initialSync.ledger);
+  const [ledgerRevision, setLedgerRevision] = createSignal(storedLedger?.revision ?? 0);
   const [past, setPast] = createSignal<ProjectData[]>([]);
   const [future, setFuture] = createSignal<ProjectData[]>([]);
   const [selectedId, setSelectedId] = createSignal(loaded.project.tracks[0]?.segments[0]?.id ?? "");
-  const [saveStatus, setSaveStatus] = createSignal<"saved" | "saving" | "offline">("saved");
+  const [saveStatus, setSaveStatus] = createSignal<SaveStatus>("saved");
+  const [ledgerSaveState, setLedgerSaveState] = createSignal<"saved" | "saving" | "error">("saved");
   const [lastAction, setLastAction] = createSignal("示例项目已就绪");
   const [conflict, setConflict] = createSignal<PersistedEnvelope | null>(null);
   const [online, setOnline] = createSignal(true);
   const [helpOpen, setHelpOpen] = createSignal(false);
+  const [ledgerOpen, setLedgerOpen] = createSignal(false);
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
-  const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
+  const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low" | "returned">("all");
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
+  let ledgerSaveTimer: number | undefined;
   let hydrated = false;
   let dirty = false;
 
@@ -127,10 +163,24 @@ export default function OralHistoryEditor() {
     return data.tracks.find((track) => track.id === data.activeTrackId) ?? data.tracks[0];
   });
   const activeSegment = createMemo(() => activeTrack()?.segments.find((item) => item.id === selectedId()) ?? null);
+  const ledgerBySegment = createMemo(() => {
+    const map = new Map<string, DeliveryEntry>();
+    for (const entry of ledger().entries) map.set(entry.segmentId, entry);
+    return map;
+  });
+  const ledgerStats = createMemo(() => {
+    const entries = ledger().entries;
+    return {
+      pending: entries.filter((entry) => entry.status === "待交").length,
+      delivered: entries.filter((entry) => entry.status === "已交付").length,
+      returned: entries.filter((entry) => entry.returned).length,
+    };
+  });
   const visibleSegments = createMemo(() => {
     const segments = activeTrack()?.segments ?? [];
     if (trackFilter() === "unreviewed") return segments.filter((segment) => !segment.reviewed);
     if (trackFilter() === "low") return segments.filter((segment) => segment.confidence <= 2 || segment.flags.lowConfidence);
+    if (trackFilter() === "returned") return segments.filter((segment) => ledgerBySegment().get(segment.id)?.returned);
     return segments;
   });
   const completedPercent = createMemo(() => {
@@ -343,6 +393,28 @@ export default function OralHistoryEditor() {
     });
   };
 
+  /** 交付员逐条登记交付状态：只动台账，不碰稿库。 */
+  const setEntryStatus = (entryId: string, status: DeliveryStatus) => {
+    const now = new Date().toISOString();
+    setLedger((current) => ({
+      ...current,
+      updatedAt: now,
+      entries: current.entries.map((entry) =>
+        entry.id === entryId
+          ? {
+              ...entry,
+              status,
+              returned: status === "已交付" ? false : entry.returned,
+              deliveredAt: status === "已交付" ? now : entry.deliveredAt,
+              updatedAt: now,
+            }
+          : entry,
+      ),
+    }));
+    setLedgerRevision((value) => value + 1);
+    setLastAction(status === "已交付" ? "台账登记：已交付" : "台账登记：退回待交");
+  };
+
   const resolveConflict = (useIncoming: boolean) => {
     const incoming = conflict();
     if (!incoming) return;
@@ -366,7 +438,21 @@ export default function OralHistoryEditor() {
     const handleOnline = () => setOnline(true);
     const handleOffline = () => setOnline(false);
     const handleStorage = (event: StorageEvent) => {
-      if (event.key !== "sologsb-1007-project-v1" || !event.newValue) return;
+      if (!event.newValue) return;
+      if (event.key === LEDGER_KEY) {
+        try {
+          const incoming = JSON.parse(event.newValue) as LedgerEnvelope;
+          if (incoming.tabId !== TAB_ID && incoming.revision > ledgerRevision()) {
+            setLedger(incoming.ledger);
+            setLedgerRevision(incoming.revision);
+            setLastAction("已载入其他标签页登记的交付台账");
+          }
+        } catch {
+          // Ignore unrelated or malformed storage events.
+        }
+        return;
+      }
+      if (event.key !== STORAGE_KEY) return;
       try {
         const incoming = JSON.parse(event.newValue) as PersistedEnvelope;
         if (incoming.tabId !== TAB_ID && incoming.revision > revision()) setConflict(incoming);
@@ -386,9 +472,15 @@ export default function OralHistoryEditor() {
       if (command && event.key.toLowerCase() === "s") {
         event.preventDefault();
         const envelope = saveProject(project(), revision(), TAB_ID);
-        setSaveStatus("saved");
-        setLastAction("已保存本地草稿");
-        channel?.postMessage(envelope);
+        const ledgerEnvelope = saveLedger(ledger(), ledgerRevision(), TAB_ID);
+        setSaveStatus(envelope ? "saved" : "error");
+        setLedgerSaveState(ledgerEnvelope ? "saved" : "error");
+        if (envelope && ledgerEnvelope) {
+          setLastAction("已保存本地草稿与交付台账");
+        } else {
+          setLastAction("有内容保存失败，已标记待重试");
+        }
+        if (envelope) channel?.postMessage(envelope);
         return;
       }
       if (editing) return;
@@ -426,24 +518,73 @@ export default function OralHistoryEditor() {
     if (event.data.tabId !== TAB_ID && event.data.revision > revision()) setConflict(event.data);
   });
 
-  createEffect(() => {
-    const current = project();
-    const currentRevision = revision();
-    if (!hydrated) return;
-    setSaveStatus(online() ? "saving" : "offline");
-    window.clearTimeout(saveTimer);
-    saveTimer = window.setTimeout(() => {
-      const envelope = saveProject(current, currentRevision, TAB_ID);
+  const runProjectSave = () => {
+    const envelope = saveProject(project(), revision(), TAB_ID);
+    if (envelope) {
       setSaveStatus(online() ? "saved" : "offline");
       if (dirty) {
         channel?.postMessage(envelope);
         dirty = false;
       }
-    }, 420);
+    } else {
+      setSaveStatus("error");
+      setLastAction("稿库保存失败，已标记待重试");
+    }
+  };
+
+  const runLedgerSave = () => {
+    const envelope = saveLedger(ledger(), ledgerRevision(), TAB_ID);
+    if (envelope) {
+      setLedgerSaveState("saved");
+    } else {
+      setLedgerSaveState("error");
+      setLastAction("交付台账保存失败，已标记待重试");
+    }
+  };
+
+  // 稿库与台账各自独立保存；首次运行只补做上次失败留下的重试，核过没问题的不再重存。
+  let projectSaveArmed = pendingSaveRetry("project");
+  createEffect(() => {
+    project();
+    revision();
+    if (!hydrated) return;
+    if (!projectSaveArmed) {
+      projectSaveArmed = true;
+      return;
+    }
+    setSaveStatus(online() ? "saving" : "offline");
+    window.clearTimeout(saveTimer);
+    saveTimer = window.setTimeout(runProjectSave, 420);
+  });
+
+  let ledgerSaveArmed = pendingSaveRetry("ledger") || ledgerChangedOnLoad;
+  createEffect(() => {
+    ledger();
+    ledgerRevision();
+    if (!hydrated) return;
+    if (!ledgerSaveArmed) {
+      ledgerSaveArmed = true;
+      return;
+    }
+    setLedgerSaveState("saving");
+    window.clearTimeout(ledgerSaveTimer);
+    ledgerSaveTimer = window.setTimeout(runLedgerSave, 420);
+  });
+
+  // 稿库任何改动（含撤销重做、导入、冲突取舍）都核对进台账；台账只读稿库，绝不回写，
+  // 校对员还没落盘的句子保持原样，不会被这轮核对改掉。
+  createEffect(() => {
+    const current = project();
+    const synced = syncLedgerWithProject(current, untrack(ledger));
+    if (synced.changed) {
+      setLedger(synced.ledger);
+      setLedgerRevision((value) => value + 1);
+    }
   });
 
   onCleanup(() => {
     window.clearTimeout(saveTimer);
+    window.clearTimeout(ledgerSaveTimer);
     channel?.close();
   });
 
@@ -506,6 +647,19 @@ export default function OralHistoryEditor() {
             <p>修改会自动保存在本机；断网后仍可继续校对。</p>
           </section>
 
+          <section class="panel-section ledger-card">
+            <div class="section-title"><h2>交付台账</h2><span>{ledger().entries.length} 条</span></div>
+            <div class="ledger-stats">
+              <span>待交<b>{ledgerStats().pending}</b></span>
+              <span>已交付<b>{ledgerStats().delivered}</b></span>
+              <span class={ledgerStats().returned ? "warn" : ""}>打回<b>{ledgerStats().returned}</b></span>
+            </div>
+            <button class="wide-action" onClick={() => setLedgerOpen(true)}><span>▤</span> 打开交付台账</button>
+            <Show when={ledgerSaveState() === "error"} fallback={<div class="hint">稿库改动会自动作废对应台账条目。</div>}>
+              <div class="hint warn">台账保存失败，已标记，下次打开自动重试。</div>
+            </Show>
+          </section>
+
           <section class="panel-section">
             <div class="section-title"><h2>文本轨道</h2><span>{project().tracks.length}</span></div>
             <div class="track-list">
@@ -555,6 +709,7 @@ export default function OralHistoryEditor() {
               <button class={trackFilter() === "all" ? "active" : ""} onClick={() => setTrackFilter("all")}>全部</button>
               <button class={trackFilter() === "unreviewed" ? "active" : ""} onClick={() => setTrackFilter("unreviewed")}>未校对</button>
               <button class={trackFilter() === "low" ? "active" : ""} onClick={() => setTrackFilter("low")}>低置信</button>
+              <button class={trackFilter() === "returned" ? "active" : ""} onClick={() => setTrackFilter("returned")}>交付打回</button>
             </div>
           </div>
 
@@ -565,7 +720,7 @@ export default function OralHistoryEditor() {
                   id={`segment-${segment.id}`}
                   role="option"
                   aria-selected={segment.id === selectedId()}
-                  class={`segment-card ${segment.id === selectedId() ? "selected" : ""} ${segment.reviewed ? "reviewed" : ""}`}
+                  class={`segment-card ${segment.id === selectedId() ? "selected" : ""} ${segment.reviewed ? "reviewed" : ""} ${ledgerBySegment().get(segment.id)?.returned ? "returned" : ""}`}
                   onClick={() => clickSegment(segment.id)}
                 >
                   <div class="segment-rail" style={{ background: speakerById(segment.speakerId)?.color ?? "#64748b" }} />
@@ -581,6 +736,7 @@ export default function OralHistoryEditor() {
                       <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
                       <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
                       <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
+                      <Show when={ledgerBySegment().get(segment.id)?.returned}><span class="pill returned">交付打回</span></Show>
                     </div>
                     <p>{segment.text}</p>
                     <div class="segment-tags">
@@ -743,6 +899,54 @@ export default function OralHistoryEditor() {
               <span><kbd>?</kbd> 显示本帮助</span>
             </div>
             <div class="dialog-footer"><button class="btn btn-primary" onClick={() => setHelpOpen(false)}>开始校对</button></div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog>
+
+      <Dialog open={ledgerOpen()} onOpenChange={setLedgerOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay class="dialog-overlay" />
+          <Dialog.Content class="dialog-content ledger-dialog">
+            <Dialog.Title>交付台账</Dialog.Title>
+            <Dialog.Description>
+              台账与稿库各存一份、各自保存。稿库中片段正文、时间码或发言人一经改动，对应条目即作废退回“待交”；已交付过的条目会标记“打回”并显示在稿库列表中。
+            </Dialog.Description>
+            <div class="ledger-summary">
+              <span>待交 {ledgerStats().pending}</span>
+              <span>已交付 {ledgerStats().delivered}</span>
+              <span class={ledgerStats().returned ? "warn" : ""}>打回 {ledgerStats().returned}</span>
+              <span class={`ledger-save ${ledgerSaveState()}`}>
+                {ledgerSaveState() === "error" ? "台账保存失败 · 待重试" : ledgerSaveState() === "saving" ? "台账保存中…" : "台账已保存"}
+              </span>
+            </div>
+            <div class="ledger-list">
+              <For each={ledger().entries} fallback={<div class="mini-empty">台账暂无条目。稿库中未校对的片段会自动补登进来。</div>}>
+                {(entry) => (
+                  <article class={`ledger-entry ${entry.returned ? "returned" : ""}`}>
+                    <header>
+                      <strong>{project().tracks.find((track) => track.id === entry.trackId)?.name ?? "未知轨道"}</strong>
+                      <span class="ledger-time">{formatTime(entry.start, false)} — {formatTime(entry.end, false)}</span>
+                      <span class={`pill ${entry.status === "已交付" ? "done" : "pending"}`}>{entry.status}</span>
+                      <Show when={entry.returned}><span class="pill returned">打回</span></Show>
+                    </header>
+                    <p><b>{speakerById(entry.speakerId)?.name ?? "未知发言人"}：</b>{entry.text}</p>
+                    <footer>
+                      <time>
+                        更新于 {new Date(entry.updatedAt).toLocaleString()}
+                        {entry.deliveredAt ? ` · 交付于 ${new Date(entry.deliveredAt).toLocaleString()}` : ""}
+                      </time>
+                      <button
+                        class={`ledger-action ${entry.status === "已交付" ? "pending" : "deliver"}`}
+                        onClick={() => setEntryStatus(entry.id, entry.status === "已交付" ? "待交" : "已交付")}
+                      >
+                        {entry.status === "已交付" ? "退回待交" : "登记已交付"}
+                      </button>
+                    </footer>
+                  </article>
+                )}
+              </For>
+            </div>
+            <div class="dialog-footer"><button class="btn btn-primary" onClick={() => setLedgerOpen(false)}>完成</button></div>
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog>
